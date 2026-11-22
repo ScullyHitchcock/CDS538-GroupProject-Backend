@@ -6,7 +6,13 @@ import uuid
 import boto3
 from botocore.exceptions import ClientError
 
-from order_items import MAX_ITEM_QUANTITY, build_order_items, matches_saved_items, parse_cart
+from order_items import (
+    MAX_ITEM_QUANTITY,
+    build_order_items,
+    matches_saved_items,
+    ordered_products,
+    parse_cart,
+)
 from store_availability import set_sold_out, sold_out_at_checkout, sold_out_product_ids, write_available_order
 
 # 表名从环境变量读取，不写死在代码里（在 Lambda 控制台设置 TABLE_NAME）
@@ -22,6 +28,12 @@ MENU = {
     "jasmine-milk-tea": {"name": "茉莉奶绿", "priceCents": 1500, "options": STANDARD_DRINK_OPTIONS},
     "lemon-tea": {"name": "柠檬茶", "priceCents": 1300, "options": STANDARD_DRINK_OPTIONS},
 }
+
+TOPPINGS = {
+    "topping-pearl": {"name": "珍珠", "priceCents": 300},
+    "topping-coconut": {"name": "椰果", "priceCents": 300},
+}
+PRODUCTS = MENU | TOPPINGS
 
 
 def respond(status, body):
@@ -60,18 +72,29 @@ def list_stores():
     return stores
 
 
+def catalog_products(products):
+    return [{"productId": product_id, **product} for product_id, product in products.items()]
+
+
 def store_menu(store_id, include_sold_out=False):
     sold_out = sold_out_product_ids(store_id)
-    return [
-        {"productId": product_id, **drink, "soldOut": product_id in sold_out}
-        for product_id, drink in MENU.items()
-        if include_sold_out or product_id not in sold_out
+    drinks = [
+        {**drink, "soldOut": drink["productId"] in sold_out}
+        for drink in catalog_products(MENU)
     ]
+    return {
+        "menu": drinks if include_sold_out else [drink for drink in drinks if not drink["soldOut"]],
+        "toppings": [
+            {**topping, "soldOut": topping["productId"] in sold_out}
+            for topping in catalog_products(TOPPINGS)
+        ],
+    }
 
 
 def update_merchant_menu(store_id, product_id, body):
-    if product_id not in MENU:
-        return respond(404, {"error": "unknown drink"})
+    product = PRODUCTS.get(product_id)
+    if product is None:
+        return respond(404, {"error": "unknown product"})
     try:
         data = json.loads(body or "{}")
     except json.JSONDecodeError:
@@ -81,7 +104,7 @@ def update_merchant_menu(store_id, product_id, body):
         return respond(400, {"error": "soldOut must be a boolean"})
 
     set_sold_out(store_id, product_id, sold_out)
-    return respond(200, {"productId": product_id, **MENU[product_id], "soldOut": sold_out})
+    return respond(200, {"productId": product_id, **product, "soldOut": sold_out})
 
 
 def query_orders(**options):
@@ -117,14 +140,14 @@ def create_or_recover_cart_order(order, checkout_id, cart):
     if order["storeId"] not in list_stores():
         return respond(400, {"error": "select an available store"})
     try:
-        items, total_amount_cents = build_order_items(cart, MENU)
+        items, total_amount_cents = build_order_items(cart, MENU, TOPPINGS)
     except ValueError as error:
         return respond(400, {"error": str(error)})
     order["items"] = items
     order["totalAmountCents"] = total_amount_cents
-    product_ids = dict.fromkeys(item["productId"] for item in items)
+    products = ordered_products(items)
     try:
-        write_available_order(table.name, order, product_ids)
+        write_available_order(table.name, order, products)
     except ClientError as error:
         if error.response["Error"]["Code"] != "TransactionCanceledException":
             raise
@@ -133,8 +156,8 @@ def create_or_recover_cart_order(order, checkout_id, cart):
             return respond_to_saved_order(existing, order, cart)
         sold_out = sold_out_at_checkout(error, order["storeId"])
         unavailable = [
-            {"productId": product_id, "name": MENU[product_id]["name"]}
-            for product_id in product_ids
+            {"productId": product_id, "name": name}
+            for product_id, name in products.items()
             if product_id in sold_out
         ]
         if not unavailable:
@@ -200,7 +223,8 @@ def lambda_handler(event, context):
             "stores": [
                 {"storeId": store_id, "name": name} for store_id, name in list_stores().items()
             ],
-            "menu": [{"productId": product_id, **drink} for product_id, drink in MENU.items()],
+            "menu": catalog_products(MENU),
+            "toppings": catalog_products(TOPPINGS),
             "maxItemQuantity": MAX_ITEM_QUANTITY,
         })
 
@@ -211,14 +235,14 @@ def lambda_handler(event, context):
         store_id = event["pathParameters"]["storeId"]
         if store_id not in list_stores():
             return respond(404, {"error": "store not found"})
-        return respond(200, {"menu": store_menu(store_id)})
+        return respond(200, store_menu(store_id))
 
     if route in ("GET /merchant/menu", "PATCH /merchant/menu/{productId}"):
         if not has_group(claims, "merchants"):
             return respond(403, {"error": "only merchants can manage store menus"})
 
         if route == "GET /merchant/menu":
-            return respond(200, {"menu": store_menu(user_id, include_sold_out=True)})
+            return respond(200, store_menu(user_id, include_sold_out=True))
         return update_merchant_menu(user_id, event["pathParameters"]["productId"], event.get("body"))
 
     if route == "POST /orders":
