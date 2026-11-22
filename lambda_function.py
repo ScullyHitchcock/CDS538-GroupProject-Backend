@@ -157,7 +157,10 @@ def respond_to_saved_order(existing, order, cart):
     same_checkout = all(existing.get(field) == order[field] for field in ("customerId", "storeId", "note"))
     saved_cart = {cart_line_key(item): item["quantity"] for item in existing.get("items", [])}
     if not same_checkout or saved_cart != cart:
-        return respond(409, {"error": "checkout ID is already in use"})
+        return respond(409, {
+            "code": "CHECKOUT_ID_CONFLICT",
+            "error": "checkout ID is already in use",
+        })
     return respond(200, existing)
 
 
