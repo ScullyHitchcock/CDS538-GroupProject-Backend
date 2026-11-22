@@ -12,10 +12,14 @@ from store_availability import set_sold_out, sold_out_at_checkout, sold_out_prod
 table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
 cognito = boto3.client("cognito-idp")
 
+STANDARD_DRINK_OPTIONS = {
+    "ice": {"choices": ["正常冰", "少冰", "去冰"], "default": "正常冰"},
+    "sugar": {"choices": ["正常糖", "半糖", "无糖"], "default": "正常糖"},
+}
 MENU = {
-    "pearl-milk-tea": {"name": "珍珠奶茶", "priceCents": 1600},
-    "jasmine-milk-tea": {"name": "茉莉奶绿", "priceCents": 1500},
-    "lemon-tea": {"name": "柠檬茶", "priceCents": 1300},
+    "pearl-milk-tea": {"name": "珍珠奶茶", "priceCents": 1600, "options": STANDARD_DRINK_OPTIONS},
+    "jasmine-milk-tea": {"name": "茉莉奶绿", "priceCents": 1500, "options": STANDARD_DRINK_OPTIONS},
+    "lemon-tea": {"name": "柠檬茶", "priceCents": 1300, "options": STANDARD_DRINK_OPTIONS},
 }
 MAX_ITEM_QUANTITY = 99
 
@@ -91,9 +95,14 @@ def query_orders(**options):
         options["ExclusiveStartKey"] = last_key
 
 
+def cart_line_key(item):
+    options = item.get("options", {})
+    return item["productId"], options.get("ice"), options.get("sugar")
+
+
 def parse_cart(items):
     if not isinstance(items, list) or not items:
-        raise ValueError("select at least one drink and list each drink once")
+        raise ValueError("select at least one drink")
 
     cart = {}
     for entry in items:
@@ -101,34 +110,52 @@ def parse_cart(items):
             raise ValueError("invalid order item")
         product_id = entry.get("productId")
         quantity = entry.get("quantity")
-        if not isinstance(product_id, str) or not product_id or product_id in cart:
-            raise ValueError("unknown or duplicate drink")
+        if not isinstance(product_id, str) or not product_id:
+            raise ValueError("unknown drink")
         if type(quantity) is not int or quantity < 1:
             raise ValueError("invalid drink quantity")
-        cart[product_id] = quantity
+        if "options" in entry:
+            options = entry["options"]
+            if not isinstance(options, dict) or set(options) != {"ice", "sugar"} or any(
+                not isinstance(value, str) for value in options.values()
+            ):
+                raise ValueError("select both ice and sugar levels")
+
+        key = cart_line_key(entry)
+        if key in cart:
+            raise ValueError("list each drink and option combination once")
+        cart[key] = quantity
     return cart
 
 
 def build_order_items(cart):
     items = []
-    for product_id, quantity in cart.items():
+    quantities = {}
+    for (product_id, ice, sugar), quantity in cart.items():
         drink = MENU.get(product_id)
         if drink is None:
             raise ValueError("unknown drink")
-        if quantity > MAX_ITEM_QUANTITY:
+        quantities[product_id] = quantities.get(product_id, 0) + quantity
+        if quantities[product_id] > MAX_ITEM_QUANTITY:
             raise ValueError("invalid drink quantity")
-        items.append({
+
+        item = {
             "productId": product_id,
             "name": drink["name"],
             "quantity": quantity,
             "unitPriceCents": drink["priceCents"],
-        })
+        }
+        if ice is not None:
+            if ice not in drink["options"]["ice"]["choices"] or sugar not in drink["options"]["sugar"]["choices"]:
+                raise ValueError("select valid ice and sugar levels for this drink")
+            item["options"] = {"ice": ice, "sugar": sugar}
+        items.append(item)
     return items
 
 
 def respond_to_saved_order(existing, order, cart):
     same_checkout = all(existing.get(field) == order[field] for field in ("customerId", "storeId", "note"))
-    saved_cart = {item["productId"]: item["quantity"] for item in existing.get("items", [])}
+    saved_cart = {cart_line_key(item): item["quantity"] for item in existing.get("items", [])}
     if not same_checkout or saved_cart != cart:
         return respond(409, {"error": "checkout ID is already in use"})
     return respond(200, existing)
@@ -151,8 +178,9 @@ def create_or_recover_cart_order(order, checkout_id, cart):
         return respond(400, {"error": str(error)})
     order["items"] = items
     order["totalAmountCents"] = sum(item["quantity"] * item["unitPriceCents"] for item in items)
+    product_ids = dict.fromkeys(item["productId"] for item in items)
     try:
-        write_available_order(table.name, order, cart)
+        write_available_order(table.name, order, product_ids)
     except ClientError as error:
         if error.response["Error"]["Code"] != "TransactionCanceledException":
             raise
@@ -161,9 +189,9 @@ def create_or_recover_cart_order(order, checkout_id, cart):
             return respond_to_saved_order(existing, order, cart)
         sold_out = sold_out_at_checkout(error, order["storeId"])
         unavailable = [
-            {"productId": item["productId"], "name": item["name"]}
-            for item in items
-            if item["productId"] in sold_out
+            {"productId": product_id, "name": MENU[product_id]["name"]}
+            for product_id in product_ids
+            if product_id in sold_out
         ]
         if not unavailable:
             raise

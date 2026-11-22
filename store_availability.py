@@ -25,8 +25,8 @@ def set_sold_out(store_id, product_id, sold_out):
     )
 
 
-def write_available_order(orders_table, order, cart):
-    products = {f":product{index}": {"S": product_id} for index, product_id in enumerate(cart)}
+def write_available_order(orders_table, order, product_ids):
+    products = {f":product{index}": {"S": product_id} for index, product_id in enumerate(product_ids)}
     in_stock = " AND ".join(f"NOT contains(soldOutProductIds, {value})" for value in products)
 
     retry_on_transaction_conflict(
