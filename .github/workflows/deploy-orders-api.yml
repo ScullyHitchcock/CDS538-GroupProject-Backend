@@ -1,0 +1,47 @@
+name: Deploy orders-api
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: orders-api-us-east-1
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check and package Lambda code
+        run: |
+          python3 -m py_compile ./*.py
+          zip -j "$RUNNER_TEMP/orders-api.zip" ./*.py
+
+      - name: Obtain AWS deployment credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::975050077540:role/CDS538-GitHub-OrdersDeploy
+          aws-region: us-east-1
+          role-session-name: cds538-orders-${{ github.run_id }}
+          role-duration-seconds: 900
+
+      - name: Deploy and verify orders-api
+        run: |
+          package="$RUNNER_TEMP/orders-api.zip"
+          revision=$(aws lambda get-function-configuration --function-name orders-api --query RevisionId --output text)
+          aws lambda update-function-code --function-name orders-api --revision-id "$revision" \
+            --zip-file "fileb://$package" --query 'LastUpdateStatus' --output text
+          aws lambda wait function-updated-v2 --function-name orders-api
+          expected=$(openssl dgst -sha256 -binary "$package" | openssl base64 -A)
+          actual=$(aws lambda get-function-configuration --function-name orders-api --query CodeSha256 --output text)
+          test "$expected" = "$actual"
+          echo "Verified orders-api deployment for $GITHUB_SHA"
