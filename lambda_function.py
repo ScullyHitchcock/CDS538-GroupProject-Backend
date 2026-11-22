@@ -6,6 +6,7 @@ import uuid
 import boto3
 from botocore.exceptions import ClientError
 
+from order_items import MAX_ITEM_QUANTITY, build_order_items, matches_saved_items, parse_cart
 from store_availability import set_sold_out, sold_out_at_checkout, sold_out_product_ids, write_available_order
 
 # 表名从环境变量读取，不写死在代码里（在 Lambda 控制台设置 TABLE_NAME）
@@ -21,7 +22,6 @@ MENU = {
     "jasmine-milk-tea": {"name": "茉莉奶绿", "priceCents": 1500, "options": STANDARD_DRINK_OPTIONS},
     "lemon-tea": {"name": "柠檬茶", "priceCents": 1300, "options": STANDARD_DRINK_OPTIONS},
 }
-MAX_ITEM_QUANTITY = 99
 
 
 def respond(status, body):
@@ -95,68 +95,9 @@ def query_orders(**options):
         options["ExclusiveStartKey"] = last_key
 
 
-def cart_line_key(item):
-    options = item.get("options", {})
-    return item["productId"], options.get("ice"), options.get("sugar")
-
-
-def parse_cart(items):
-    if not isinstance(items, list) or not items:
-        raise ValueError("select at least one drink")
-
-    cart = {}
-    for entry in items:
-        if not isinstance(entry, dict):
-            raise ValueError("invalid order item")
-        product_id = entry.get("productId")
-        quantity = entry.get("quantity")
-        if not isinstance(product_id, str) or not product_id:
-            raise ValueError("unknown drink")
-        if type(quantity) is not int or quantity < 1:
-            raise ValueError("invalid drink quantity")
-        if "options" in entry:
-            options = entry["options"]
-            if not isinstance(options, dict) or set(options) != {"ice", "sugar"} or any(
-                not isinstance(value, str) for value in options.values()
-            ):
-                raise ValueError("select both ice and sugar levels")
-
-        key = cart_line_key(entry)
-        if key in cart:
-            raise ValueError("list each drink and option combination once")
-        cart[key] = quantity
-    return cart
-
-
-def build_order_items(cart):
-    items = []
-    quantities = {}
-    for (product_id, ice, sugar), quantity in cart.items():
-        drink = MENU.get(product_id)
-        if drink is None:
-            raise ValueError("unknown drink")
-        quantities[product_id] = quantities.get(product_id, 0) + quantity
-        if quantities[product_id] > MAX_ITEM_QUANTITY:
-            raise ValueError("invalid drink quantity")
-
-        item = {
-            "productId": product_id,
-            "name": drink["name"],
-            "quantity": quantity,
-            "unitPriceCents": drink["priceCents"],
-        }
-        if ice is not None:
-            if ice not in drink["options"]["ice"]["choices"] or sugar not in drink["options"]["sugar"]["choices"]:
-                raise ValueError("select valid ice and sugar levels for this drink")
-            item["options"] = {"ice": ice, "sugar": sugar}
-        items.append(item)
-    return items
-
-
 def respond_to_saved_order(existing, order, cart):
     same_checkout = all(existing.get(field) == order[field] for field in ("customerId", "storeId", "note"))
-    saved_cart = {cart_line_key(item): item["quantity"] for item in existing.get("items", [])}
-    if not same_checkout or saved_cart != cart:
+    if not same_checkout or not matches_saved_items(cart, existing.get("items", [])):
         return respond(409, {
             "code": "CHECKOUT_ID_CONFLICT",
             "error": "checkout ID is already in use",
@@ -176,11 +117,11 @@ def create_or_recover_cart_order(order, checkout_id, cart):
     if order["storeId"] not in list_stores():
         return respond(400, {"error": "select an available store"})
     try:
-        items = build_order_items(cart)
+        items, total_amount_cents = build_order_items(cart, MENU)
     except ValueError as error:
         return respond(400, {"error": str(error)})
     order["items"] = items
-    order["totalAmountCents"] = sum(item["quantity"] * item["unitPriceCents"] for item in items)
+    order["totalAmountCents"] = total_amount_cents
     product_ids = dict.fromkeys(item["productId"] for item in items)
     try:
         write_available_order(table.name, order, product_ids)
