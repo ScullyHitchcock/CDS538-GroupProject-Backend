@@ -65,47 +65,73 @@ def query_orders(**options):
         options["ExclusiveStartKey"] = last_key
 
 
-def build_order_items(cart):
-    if not isinstance(cart, list) or not 1 <= len(cart) <= len(MENU):
+def parse_cart(items):
+    if not isinstance(items, list) or not items:
         raise ValueError("select at least one drink and list each drink once")
 
-    items = {}
-    for entry in cart:
+    cart = {}
+    for entry in items:
         if not isinstance(entry, dict):
             raise ValueError("invalid order item")
         product_id = entry.get("productId")
         quantity = entry.get("quantity")
-        if not isinstance(product_id, str) or product_id not in MENU or product_id in items:
+        if not isinstance(product_id, str) or not product_id or product_id in cart:
             raise ValueError("unknown or duplicate drink")
-        if type(quantity) is not int or not 1 <= quantity <= MAX_ITEM_QUANTITY:
+        if type(quantity) is not int or quantity < 1:
             raise ValueError("invalid drink quantity")
-        drink = MENU[product_id]
-        items[product_id] = {
+        cart[product_id] = quantity
+    return cart
+
+
+def build_order_items(cart):
+    items = []
+    for product_id, quantity in cart.items():
+        drink = MENU.get(product_id)
+        if drink is None:
+            raise ValueError("unknown drink")
+        if quantity > MAX_ITEM_QUANTITY:
+            raise ValueError("invalid drink quantity")
+        items.append({
             "productId": product_id,
             "name": drink["name"],
             "quantity": quantity,
             "unitPriceCents": drink["priceCents"],
-        }
-    return list(items.values())
+        })
+    return items
 
 
-def save_cart_order(order, checkout_id):
+def respond_to_saved_order(existing, order, cart):
+    same_checkout = all(existing.get(field) == order[field] for field in ("customerId", "storeId", "note"))
+    saved_cart = {item["productId"]: item["quantity"] for item in existing.get("items", [])}
+    if not same_checkout or saved_cart != cart:
+        return respond(409, {"error": "checkout ID is already in use"})
+    return respond(200, existing)
+
+
+def create_or_recover_cart_order(order, checkout_id, cart):
     # 同一顾客重试同一结算请求时，写入条件避免生成第二笔订单。
     order_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f'{order["customerId"]}:{checkout_id}'))
     order["orderId"] = order_id
+    lookup = {"Key": {"orderId": order_id}, "ConsistentRead": True}
+    existing = table.get_item(**lookup).get("Item")
+    if existing is not None:
+        return respond_to_saved_order(existing, order, cart)
+
+    if order["storeId"] not in list_stores():
+        return respond(400, {"error": "select an available store"})
+    try:
+        items = build_order_items(cart)
+    except ValueError as error:
+        return respond(400, {"error": str(error)})
+    order["items"] = items
+    order["totalAmountCents"] = sum(item["quantity"] * item["unitPriceCents"] for item in items)
     try:
         table.put_item(Item=order, ConditionExpression="attribute_not_exists(orderId)")
     except ClientError as error:
         if error.response["Error"]["Code"] != "ConditionalCheckFailedException":
             raise
-        existing = table.get_item(Key={"orderId": order_id}, ConsistentRead=True).get("Item", {})
-        if any(existing.get(field) != order[field] for field in ("customerId", "storeId", "note")):
-            return respond(409, {"error": "checkout ID is already in use"})
-        existing_cart = {item["productId"]: item["quantity"] for item in existing.get("items", [])}
-        requested_cart = {item["productId"]: item["quantity"] for item in order["items"]}
-        if existing_cart != requested_cart:
-            return respond(409, {"error": "checkout ID is already in use"})
-        return respond(200, existing)
+        existing = table.get_item(**lookup).get("Item", {})
+        return respond_to_saved_order(existing, order, cart)
     return respond(201, order)
 
 
@@ -142,7 +168,7 @@ def lambda_handler(event, context):
         except json.JSONDecodeError:
             return respond(400, {"error": "invalid order body"})
         store_id = data.get("storeId") if isinstance(data, dict) else None
-        if not isinstance(store_id, str) or not store_id or store_id not in list_stores():
+        if not isinstance(store_id, str) or not store_id:
             return respond(400, {"error": "select an available store"})
 
         order = {
@@ -154,6 +180,8 @@ def lambda_handler(event, context):
         }
         if "items" not in data:
             # 兼容购物车上线前的前端和已有调用者。
+            if store_id not in list_stores():
+                return respond(400, {"error": "select an available store"})
             order["orderId"] = str(uuid.uuid4())
             table.put_item(Item=order)
             return respond(201, order)
@@ -165,12 +193,10 @@ def lambda_handler(event, context):
             checkout_uuid = uuid.UUID(checkout_id)
             if checkout_uuid.version != 4:
                 return respond(400, {"error": "invalid checkout ID"})
-            items = build_order_items(data["items"])
+            cart = parse_cart(data["items"])
         except ValueError as error:
             return respond(400, {"error": str(error)})
-        order["items"] = items
-        order["totalAmountCents"] = sum(item["quantity"] * item["unitPriceCents"] for item in items)
-        return save_cart_order(order, checkout_uuid)
+        return create_or_recover_cart_order(order, checkout_uuid, cart)
 
     if route == "GET /orders":
         if not has_group(claims, "customers"):
