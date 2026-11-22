@@ -40,7 +40,7 @@ jobs:
           revision=$(aws lambda get-function-configuration --function-name orders-api --query RevisionId --output text)
           aws lambda update-function-code --function-name orders-api --revision-id "$revision" \
             --zip-file "fileb://$package" --query 'LastUpdateStatus' --output text
-          aws lambda wait function-updated-v2 --function-name orders-api
+          aws lambda wait function-updated --function-name orders-api
           expected=$(openssl dgst -sha256 -binary "$package" | openssl base64 -A)
           actual=$(aws lambda get-function-configuration --function-name orders-api --query CodeSha256 --output text)
           test "$expected" = "$actual"
