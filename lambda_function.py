@@ -6,6 +6,8 @@ import uuid
 import boto3
 from botocore.exceptions import ClientError
 
+from store_availability import set_sold_out, sold_out_at_checkout, sold_out_product_ids, write_available_order
+
 # 表名从环境变量读取，不写死在代码里（在 Lambda 控制台设置 TABLE_NAME）
 table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
 cognito = boto3.client("cognito-idp")
@@ -52,6 +54,30 @@ def list_stores():
             if sub:
                 stores[sub] = user["Username"]
     return stores
+
+
+def store_menu(store_id, include_sold_out=False):
+    sold_out = sold_out_product_ids(store_id)
+    return [
+        {"productId": product_id, **drink, "soldOut": product_id in sold_out}
+        for product_id, drink in MENU.items()
+        if include_sold_out or product_id not in sold_out
+    ]
+
+
+def update_merchant_menu(store_id, product_id, body):
+    if product_id not in MENU:
+        return respond(404, {"error": "unknown drink"})
+    try:
+        data = json.loads(body or "{}")
+    except json.JSONDecodeError:
+        return respond(400, {"error": "invalid menu update"})
+    sold_out = data.get("soldOut") if isinstance(data, dict) else None
+    if type(sold_out) is not bool:
+        return respond(400, {"error": "soldOut must be a boolean"})
+
+    set_sold_out(store_id, product_id, sold_out)
+    return respond(200, {"productId": product_id, **MENU[product_id], "soldOut": sold_out})
 
 
 def query_orders(**options):
@@ -126,12 +152,22 @@ def create_or_recover_cart_order(order, checkout_id, cart):
     order["items"] = items
     order["totalAmountCents"] = sum(item["quantity"] * item["unitPriceCents"] for item in items)
     try:
-        table.put_item(Item=order, ConditionExpression="attribute_not_exists(orderId)")
+        write_available_order(table.name, order, cart)
     except ClientError as error:
-        if error.response["Error"]["Code"] != "ConditionalCheckFailedException":
+        if error.response["Error"]["Code"] != "TransactionCanceledException":
             raise
-        existing = table.get_item(**lookup).get("Item", {})
-        return respond_to_saved_order(existing, order, cart)
+        existing = table.get_item(**lookup).get("Item")
+        if existing is not None:
+            return respond_to_saved_order(existing, order, cart)
+        sold_out = sold_out_at_checkout(error, order["storeId"])
+        unavailable = [
+            {"productId": item["productId"], "name": item["name"]}
+            for item in items
+            if item["productId"] in sold_out
+        ]
+        if not unavailable:
+            raise
+        return respond(409, {"code": "ITEMS_SOLD_OUT", "items": unavailable})
     return respond(201, order)
 
 
@@ -195,6 +231,23 @@ def lambda_handler(event, context):
             "menu": [{"productId": product_id, **drink} for product_id, drink in MENU.items()],
             "maxItemQuantity": MAX_ITEM_QUANTITY,
         })
+
+    if route == "GET /stores/{storeId}/menu":
+        if not has_group(claims, "customers"):
+            return respond(403, {"error": "only customers can view store menus"})
+
+        store_id = event["pathParameters"]["storeId"]
+        if store_id not in list_stores():
+            return respond(404, {"error": "store not found"})
+        return respond(200, {"menu": store_menu(store_id)})
+
+    if route in ("GET /merchant/menu", "PATCH /merchant/menu/{productId}"):
+        if not has_group(claims, "merchants"):
+            return respond(403, {"error": "only merchants can manage store menus"})
+
+        if route == "GET /merchant/menu":
+            return respond(200, {"menu": store_menu(user_id, include_sold_out=True)})
+        return update_merchant_menu(user_id, event["pathParameters"]["productId"], event.get("body"))
 
     if route == "POST /orders":
         if not has_group(claims, "customers"):
