@@ -135,6 +135,43 @@ def create_or_recover_cart_order(order, checkout_id, cart):
     return respond(201, order)
 
 
+def create_order(body, customer_id):
+    try:
+        data = json.loads(body or "{}")
+    except json.JSONDecodeError:
+        return respond(400, {"error": "invalid order body"})
+    store_id = data.get("storeId") if isinstance(data, dict) else None
+    if not isinstance(store_id, str) or not store_id:
+        return respond(400, {"error": "select an available store"})
+
+    order = {
+        "customerId": customer_id,
+        "storeId": store_id,
+        "status": "PENDING",
+        "note": str(data.get("note", "")),
+        "createdAt": int(time.time()),
+    }
+    if "items" not in data:
+        # 兼容购物车上线前的前端和已有调用者。
+        if store_id not in list_stores():
+            return respond(400, {"error": "select an available store"})
+        order["orderId"] = str(uuid.uuid4())
+        table.put_item(Item=order)
+        return respond(201, order)
+
+    checkout_id = data.get("checkoutId")
+    if not isinstance(checkout_id, str) or len(checkout_id) != 36:
+        return respond(400, {"error": "invalid checkout ID"})
+    try:
+        checkout_uuid = uuid.UUID(checkout_id)
+        if checkout_uuid.version != 4:
+            return respond(400, {"error": "invalid checkout ID"})
+        cart = parse_cart(data["items"])
+    except ValueError as error:
+        return respond(400, {"error": str(error)})
+    return create_or_recover_cart_order(order, checkout_uuid, cart)
+
+
 def lambda_handler(event, context):
     route = event["routeKey"]
 
@@ -163,40 +200,7 @@ def lambda_handler(event, context):
         if not has_group(claims, "customers"):
             return respond(403, {"error": "only customers can create orders"})
 
-        try:
-            data = json.loads(event.get("body") or "{}")
-        except json.JSONDecodeError:
-            return respond(400, {"error": "invalid order body"})
-        store_id = data.get("storeId") if isinstance(data, dict) else None
-        if not isinstance(store_id, str) or not store_id:
-            return respond(400, {"error": "select an available store"})
-
-        order = {
-            "customerId": user_id,
-            "storeId": store_id,
-            "status": "PENDING",
-            "note": str(data.get("note", "")),
-            "createdAt": int(time.time()),
-        }
-        if "items" not in data:
-            # 兼容购物车上线前的前端和已有调用者。
-            if store_id not in list_stores():
-                return respond(400, {"error": "select an available store"})
-            order["orderId"] = str(uuid.uuid4())
-            table.put_item(Item=order)
-            return respond(201, order)
-
-        checkout_id = data.get("checkoutId")
-        if not isinstance(checkout_id, str) or len(checkout_id) != 36:
-            return respond(400, {"error": "invalid checkout ID"})
-        try:
-            checkout_uuid = uuid.UUID(checkout_id)
-            if checkout_uuid.version != 4:
-                return respond(400, {"error": "invalid checkout ID"})
-            cart = parse_cart(data["items"])
-        except ValueError as error:
-            return respond(400, {"error": str(error)})
-        return create_or_recover_cart_order(order, checkout_uuid, cart)
+        return create_order(event.get("body"), user_id)
 
     if route == "GET /orders":
         if not has_group(claims, "customers"):
